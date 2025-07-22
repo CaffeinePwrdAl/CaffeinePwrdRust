@@ -1,13 +1,18 @@
 
-use std::{f32::consts, error::Error};
+use std::sync::Arc; // Atomically Reference Counted - used for the window
+use std::error::Error;
 use std::thread::sleep;
 use std::time::Duration;
+use std::f32::consts;
+
 use wgpu::{util::DeviceExt};
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
+use winit::event::StartCause;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
+
 
 use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is - raw buffer type punning?
 
@@ -45,72 +50,6 @@ impl Transforms {
     }
 }
 
-struct Config {
-    view_format: wgpu::TextureFormat,
-}
-
-struct App {
-    // Window is an Option as we can't create windows until we're running the event handler
-    window: Option<Window>,
-
-    // Wgpu top level objects
-    instance: wgpu::Instance,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: Config,
-}
-
-impl App {
-    fn init() -> Self {        
-        // Create Instance
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-
-        // Adapter (aka PhysicalDevice in Vulkan)
-        // This function is asynchronous in WebGPU, so request_adapter returns a future. On native/webgl
-        // the future resolves immediately, so we can block on it without harm.
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("Failed to create adapter");
-
-        // Print out some basic information about the adapter.
-        println!("Running on Adapter: {:#?}", adapter.get_info());
-
-        // Check to see if the adapter supports compute shaders. While WebGPU guarantees support for
-        // compute shaders, wgpu supports a wider range of devices through the use of "downlevel" devices.
-        let downlevel_capabilities = adapter.get_downlevel_capabilities();
-        /*if !downlevel_capabilities
-            .flags
-            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-        {
-            panic!("Adapter does not support compute shaders");
-        }*/
-
-        // Device/Queue
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        }))
-        .expect("Failed to create device");
-
-        // Derive from the window/swapchain/etc
-        let config = Config {
-            view_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        };
-
-        App {
-            window: None,
-            instance,
-            device,
-            queue,
-            config,
-        }
-    }
-}
-
-
 struct AppData {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
@@ -140,7 +79,7 @@ impl AppData {
         (vertex_data.to_vec(), index_data.to_vec())
     }
 
-    fn create_vertex_buffers(app: &App) -> (wgpu::Buffer, wgpu::Buffer, usize) {
+    fn create_vertex_buffers(app: &AppState) -> (wgpu::Buffer, wgpu::Buffer, usize) {
         // Create the vertex and index buffers
         let (vertex_data, index_data) = Self::create_vertices();
 
@@ -159,7 +98,7 @@ impl AppData {
         (vertex_buf, index_buf, index_data.len())
     }
 
-    fn create_uniform_buffers(app: &App, xforms_data: &Transforms) -> wgpu::Buffer {
+    fn create_uniform_buffers(app: &AppState, xforms_data: &Transforms) -> wgpu::Buffer {
         let uniform_buf = app.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
             contents: bytemuck::cast_slice(xforms_data.mvp.as_ref()),
@@ -169,7 +108,7 @@ impl AppData {
         uniform_buf
     }
 
-    fn create_layouts(app: &App) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    fn create_layouts(app: &AppState) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
         let bind_group_layout = app.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -198,7 +137,7 @@ impl AppData {
         (bind_group_layout, pipeline_layout)
     }
 
-    fn create_render_pipeline(app: &App, pipeline_layout: &wgpu::PipelineLayout ) -> wgpu::RenderPipeline {
+    fn create_render_pipeline(app: &AppState, pipeline_layout: &wgpu::PipelineLayout ) -> wgpu::RenderPipeline {
         let module = app.device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         let vertex_size = size_of::<Vertex>();
@@ -257,7 +196,7 @@ impl AppData {
 
     }
 
-    fn create_xforms_bind_group(app: &App, bind_group_layout: &wgpu::BindGroupLayout, xforms_ubo: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn create_xforms_bind_group(app: &AppState, bind_group_layout: &wgpu::BindGroupLayout, xforms_ubo: &wgpu::Buffer) -> wgpu::BindGroup {
         // The bind group contains the actual resources to bind to the pipeline.
         //
         // Even when the buffers are individually dropped, wgpu will keep the bind group and buffers
@@ -270,13 +209,13 @@ impl AppData {
                     binding: 0,
                     resource: xforms_ubo.as_entire_binding(),
                 },
-            ],
+            ],  
         });
 
         bind_group
     }
 
-    fn init(app: &App, xforms_data: &Transforms) -> Self {
+    fn init(app: &AppState, xforms_data: &Transforms) -> Self {
 
         let (vb, ib, index_count) = Self::create_vertex_buffers(app);
 
@@ -303,24 +242,130 @@ impl AppData {
 
 }
 
+struct SurfaceConfig {
+    size: winit::dpi::PhysicalSize<u32>,
+    view_format: wgpu::TextureFormat,
+}
+
+struct AppState {
+    // Window is an Option as we can't create windows until we're running the event handler
+    window: Arc<Window>,
+
+    // Wgpu top level objects
+    instance: wgpu::Instance,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    // Config of the currently active surface
+    config: SurfaceConfig,
+}
+
+
+impl AppState {
+    fn init(window: Arc<Window>) -> Self {        
+        // Create Instance
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+        // Adapter (aka PhysicalDevice in Vulkan) - function is async so need to await
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("Failed to create adapter");
+
+        // Print out some basic information about the adapter.
+        println!("Running on Adapter: {:#?}", adapter.get_info());
+
+        // Device/Queue
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("Failed to create device");
+
+        // Setup surfaces etc from window
+        let size = window.inner_size();
+        println!("Window size: {0} x {1}", size.width, size.height);
+
+        // Derive from the window/swapchain/etc
+        let config = SurfaceConfig {
+            size: size,
+            view_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        };
+
+        let state = AppState {
+            window,
+            instance,
+            device,
+            queue,
+            config,
+        };
+
+        // Further setup    
+        //let xforms_data = Transforms::create_mvp_matrix();
+        //let appdata = AppData::init(&app.state, &xforms_data);
+
+        state
+    }
+}
+
+struct App {
+    state: Option<AppState>,
+}
+
+impl App {
+    fn init() -> Self {
+        let app = App {
+            state: None,
+        };
+
+        app
+    }
+}
+
 impl ApplicationHandler for App {
 
+    // Initialisation 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+
+        match cause {
+            StartCause::Init => {
+                // First time initialisation - run once, and occurs before the first 'resumed' call
+                //
+                // Not actually sure what to do here as won't have a window yet
+            }, 
+            _ => return,
+        }
+    }
+
+    // First call should create a window. Handling back-to-back redundant calls is advised
+    // but is a little platform dependent.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        println!("Resumed");
+
         #[cfg(not(web_platform))]
         let window_attributes = WindowAttributes::default();
         #[cfg(web_platform)]
         let window_attributes = WindowAttributes::default()
             .with_platform_attributes(Box::new(WindowAttributesWeb::default().with_append(true)));
 
-        // Create Window
-        self.window = match event_loop.create_window(window_attributes) {
-            Ok(window) => Some(window),
-            Err(err) => {
-                eprintln!("error creating window: {err}");
-                event_loop.exit();
-                return;
-            },
-        }
+        let window = Arc::new(
+            event_loop
+                .create_window(window_attributes)
+                .unwrap(),
+        );
+
+        // pollster::block_on(...)?
+        let state = AppState::init(window.clone());
+        self.state = Some(state);
+    }
+
+    // Opposite of resumed - should assume all render surfaces are dead and
+    // should be re-created at next 'resumed'. Again it is advisable to handle
+    // redundant back-to-back calls
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        println!("Suspend");
     }
 
     fn window_event(
@@ -329,23 +374,38 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        println!("{event:?}");
+        
+        let state = self.state.as_mut().unwrap();
 
-        let window = match self.window.as_ref() {
-            Some(window) => window,
-            None => return,
-        };
+        // Might not be necessary...
+        // let window = match state.window.id() {
+        //     Some(window_id) => window,
+        //     None => return,
+        // };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => {
-                //fill::fill_window(window);
-                window.request_redraw();
+            WindowEvent::CloseRequested => {
+                println!("{event:?}");
+                event_loop.exit();
             },
+            WindowEvent::RedrawRequested => {
+                //println!("{event:?}");
+                
+                // Render Frame
+                //state.render()
+
+                // Temporary rate limit
+                sleep(Duration::from_millis(16));
+
+                // Submit the next re-draw event
+                state.window.request_redraw();
+            },
+            WindowEvent::Resized(size) => {
+                println!("Resize -> {0} x {1}", size.width, size.height);
+                //state.resize()
+            }
             _ => (),
         }
-
-        sleep(Duration::from_millis(16));
     }
 }
 
@@ -379,11 +439,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // with some of it tied to things like resize
     let mut app = App::init();
 
-    let xforms_data = Transforms::create_mvp_matrix();
-
-    let appdata = AppData::init(&app, &xforms_data);
-
     event_loop.run_app(&mut app)?;
+
+    Ok(())
+}
+
+
+
 
     // The command encoder allows us to record commands that we will later submit to the GPU.
     //let mut encoder =
@@ -454,6 +516,3 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Print out the result.
     //println!("Result: {:?}", result);
-
-    Ok(())
-}
