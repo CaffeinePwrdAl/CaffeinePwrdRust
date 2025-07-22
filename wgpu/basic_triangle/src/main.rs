@@ -13,9 +13,12 @@ use winit::event::StartCause;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-
 use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is - raw buffer type punning?
 
+// 
+// Vertex - structure describing a tightly packed 'C' style
+// structure for each vertex in the vertex buffer
+//
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -30,6 +33,10 @@ fn vertex(pos: glam::Vec4, uv: glam::Vec2) -> Vertex {
     }
 }
 
+//
+// Transforms - structure encapsulating the matrices we pass to the shader for transforming
+// and projecting the geometry
+//
 struct Transforms {
     mvp: glam::Mat4,
 }
@@ -50,6 +57,12 @@ impl Transforms {
     }
 }
 
+//
+// AppData - probably need to rename this, but it contains all the main gubbins for the actual
+// program. AppState is passed as an argument to most of these functions to provide access to
+// WGPU instance/adapter/device/queue, as well as configuration information about the current
+// render surface. 
+//
 struct AppData {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
@@ -242,6 +255,16 @@ impl AppData {
 
 }
 
+//
+// AppState - wrapper for the main objects of WGPU, such as the instance/adapter/device/queuee.
+//
+// The window is passed as a creation parameter, a store of configuration information is extracted
+// from the window while creating the surfaces.
+//
+// AppState is passed as a parameter to the AppData structure that contains the main portion of the
+// application logic and data and is used for allowing the application to create it's objects and
+// interface with WGPU without needing to be directly aware of windows and events.
+//
 struct SurfaceConfig {
     size: winit::dpi::PhysicalSize<u32>,
     view_format: wgpu::TextureFormat,
@@ -314,6 +337,18 @@ struct App {
     state: Option<AppState>,
 }
 
+
+//
+// App - top level struct that implements the event loop application handler traits
+//
+// When event loop is started and 'resumed' a window is opened and an AppState structure
+// is created that will contain a reference to the window and the wgpu objects like the
+// instance/adapter/device, and a store of configuration information from the window
+//
+// On a suspend/resume, or a resize the window surface will be re-created - not sure how
+// to organise that in Rust yet, but feels like there's probably a neater way to make that
+// work than I'd traditionally bothered with in C/C++
+//
 impl App {
     fn init() -> Self {
         let app = App {
@@ -415,36 +450,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // documentation for more information.
     env_logger::init();
 
-    //
-    // Winit EventLoop - impl ApplicationHandler and provide to event_loop.run_app(App::default())?;
-    //
-    //  fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _: WindowId, event: WindowEvent) {
-    //      match event {
-    //          // @sa: https://github.com/rust-windowing/winit/blob/master/winit-core/src/event.rs#L57
-    //          WindowEvent::CloseRequested
-    //          WindowEvent::SurfaceResized(PhysicalSize<u32>)
-    //          WindowEvent::RedrawRequested
-    //          _ => ()
-    //      }
-    //  }
-    //
-    //  fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {} is called when we're able
-    //  to start creating windows and surfaces. Defined inside the App, it can populate the window members
-    //  of the app struct
-    //
     let event_loop = EventLoop::new()?;
-
-    // Need to re-think the creation order, and whether an explicit init function makes sense
-    // when using Winit - might be easier to do the creation as part of the event system - 
-    // with some of it tied to things like resize
     let mut app = App::init();
-
     event_loop.run_app(&mut app)?;
 
     Ok(())
 }
 
-
+// ------------------------------------------------------------------------------------------------------------------------------------
 
 
     // The command encoder allows us to record commands that we will later submit to the GPU.
