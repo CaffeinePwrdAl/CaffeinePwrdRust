@@ -1,18 +1,15 @@
-/// To serve as an introduction to the wgpu api, we will implement a simple
-/// compute shader which takes a list of numbers on the CPU and doubles them on the GPU.
-///
-/// While this isn't a very practical example, you will see all the major components
-/// of using wgpu headlessly, including getting a device, running a shader, and transferring
-/// data between the CPU and GPU.
-///
-/// If you time the recording and execution of this example you will certainly see that
-/// running on the gpu is slower than doing the same calculation on the cpu. This is because
-/// floating point multiplication is a very simple operation so the transfer/submission overhead
-/// is quite a lot higher than the actual computation. This is normal and shows that the GPU
-/// needs a lot higher work/transfer ratio to come out ahead.
-use std::{f32::consts};
+
+use std::{f32::consts, error::Error};
+use std::thread::sleep;
+use std::time::Duration;
 use wgpu::{util::DeviceExt};
-use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is
+
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::window::{Window, WindowAttributes, WindowId};
+
+use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is - raw buffer type punning?
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -53,6 +50,10 @@ struct Config {
 }
 
 struct App {
+    // Window is an Option as we can't create windows until we're running the event handler
+    window: Option<Window>,
+
+    // Wgpu top level objects
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -100,6 +101,7 @@ impl App {
         };
 
         App {
+            window: None,
             instance,
             device,
             queue,
@@ -301,17 +303,87 @@ impl AppData {
 
 }
 
-fn main() {
+impl ApplicationHandler for App {
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(not(web_platform))]
+        let window_attributes = WindowAttributes::default();
+        #[cfg(web_platform)]
+        let window_attributes = WindowAttributes::default()
+            .with_platform_attributes(Box::new(WindowAttributesWeb::default().with_append(true)));
+
+        // Create Window
+        self.window = match event_loop.create_window(window_attributes) {
+            Ok(window) => Some(window),
+            Err(err) => {
+                eprintln!("error creating window: {err}");
+                event_loop.exit();
+                return;
+            },
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        println!("{event:?}");
+
+        let window = match self.window.as_ref() {
+            Some(window) => window,
+            None => return,
+        };
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => {
+                //fill::fill_window(window);
+                window.request_redraw();
+            },
+            _ => (),
+        }
+
+        sleep(Duration::from_millis(16));
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
     
     // To change the log level, set the `RUST_LOG` environment variable. See the `env_logger`
     // documentation for more information.
     env_logger::init();
 
-    let app = App::init();
+    //
+    // Winit EventLoop - impl ApplicationHandler and provide to event_loop.run_app(App::default())?;
+    //
+    //  fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    //      match event {
+    //          // @sa: https://github.com/rust-windowing/winit/blob/master/winit-core/src/event.rs#L57
+    //          WindowEvent::CloseRequested
+    //          WindowEvent::SurfaceResized(PhysicalSize<u32>)
+    //          WindowEvent::RedrawRequested
+    //          _ => ()
+    //      }
+    //  }
+    //
+    //  fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {} is called when we're able
+    //  to start creating windows and surfaces. Defined inside the App, it can populate the window members
+    //  of the app struct
+    //
+    let event_loop = EventLoop::new()?;
+
+    // Need to re-think the creation order, and whether an explicit init function makes sense
+    // when using Winit - might be easier to do the creation as part of the event system - 
+    // with some of it tied to things like resize
+    let mut app = App::init();
 
     let xforms_data = Transforms::create_mvp_matrix();
 
     let appdata = AppData::init(&app, &xforms_data);
+
+    event_loop.run_app(&mut app)?;
 
     // The command encoder allows us to record commands that we will later submit to the GPU.
     //let mut encoder =
@@ -382,4 +454,6 @@ fn main() {
 
     // Print out the result.
     //println!("Result: {:?}", result);
+
+    Ok(())
 }
