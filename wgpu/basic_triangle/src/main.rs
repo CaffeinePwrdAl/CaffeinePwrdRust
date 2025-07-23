@@ -1,4 +1,4 @@
-
+use std::cmp;
 use std::sync::Arc; // Atomically Reference Counted - used for the window
 use std::error::Error;
 use std::thread::sleep;
@@ -267,6 +267,7 @@ impl AppData {
 //
 struct SurfaceConfig {
     size: winit::dpi::PhysicalSize<u32>,
+    surface_format: wgpu::TextureFormat,
     view_format: wgpu::TextureFormat,
 }
 
@@ -279,12 +280,13 @@ struct AppState {
     device: wgpu::Device,
     queue: wgpu::Queue,
 
-    // Config of the currently active surface
     config: SurfaceConfig,
+    surface: wgpu::Surface<'static>, // AW: Need to read up more on lifetimes
 }
 
 
 impl AppState {
+
     fn init(window: Arc<Window>) -> Self {        
         // Create Instance
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -311,10 +313,27 @@ impl AppState {
         let size = window.inner_size();
         println!("Window size: {0} x {1}", size.width, size.height);
 
+        // Create Surface
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let cap = surface.get_capabilities(&adapter);
+        println!("Supported surface formats:");
+        for fmt in cap.formats.iter() {
+            println!("\t\t{fmt:?}");
+        }
+
+        //
+        // Preferentially choose a surface format
+        //
+       let (surface_format, view_format) = Self::choose_surface_and_view_format(cap.formats);
+
+        println!("Chosen surface format: {surface_format:?}");
+        println!("Chosen view format:    {view_format:?}");
+
         // Derive from the window/swapchain/etc
         let config = SurfaceConfig {
             size: size,
-            view_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            view_format: view_format,
+            surface_format: surface_format,
         };
 
         let state = AppState {
@@ -323,13 +342,60 @@ impl AppState {
             device,
             queue,
             config,
+            surface,
         };
 
-        // Further setup    
+        // Further setup
+        state.configure_surface();
+
         //let xforms_data = Transforms::create_mvp_matrix();
         //let appdata = AppData::init(&app.state, &xforms_data);
 
         state
+    }
+
+    fn choose_surface_and_view_format(cap_formats: Vec<wgpu::TextureFormat>) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
+        // In WebGPU with canvas objects SRGB formats are not advertised as the canvas format
+        // instead create the surface with the specified rgba8/bgra8 format and add SRGB onto
+        // the list of view formats allowed to be created from the surface.
+        let pref = [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ];
+        let mut idx = pref.len();
+
+        for fmt in cap_formats.iter() {
+            match pref.iter().position(|f| f == fmt) {
+                Some(pref) => idx = cmp::min(idx, pref),
+                None => continue,
+            }
+        }
+
+        let surface_format = match idx {
+            idx if idx < pref.len() => pref[idx],
+            _ => cap_formats[0],
+        };
+
+        // Add SRGB (if SRGB not already specified)
+        let view_format = surface_format.add_srgb_suffix();
+
+        (surface_format, view_format)
+    }
+
+    fn configure_surface(&self) {
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: self.config.surface_format,
+            width: self.config.size.width,
+            height: self.config.size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![self.config.view_format],
+        };
+        self.surface.configure(&self.device, &surface_config);
     }
 }
 
