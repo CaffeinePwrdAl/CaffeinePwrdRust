@@ -1,7 +1,11 @@
+struct Transforms {
+    vp: mat4x4<f32>,
+    m: mat4x4<f32>,
+};
 
 @group(0)
 @binding(0)
-var<uniform> transform: mat4x4<f32>;
+var<uniform> xforms: Transforms;
 
 struct VertexOutput {
     @location(0) uv: vec2<f32>,
@@ -15,19 +19,23 @@ fn vs_main(
 ) -> VertexOutput {
     var result: VertexOutput;
     result.uv = uv;
-    result.position = transform * position;
+    result.position = xforms.vp * xforms.m * position;
     return result;
+}
+
+fn pal(t: f32, a: vec3f, b: vec3f, c: vec3f, d: vec3f ) -> vec3f
+{
+    return a + b*cos( 6.28318*(c*t+d) );
 }
 
 @fragment
 fn fs_main(vertex: VertexOutput) -> @location(0) vec4<f32> {
     
-    let t = length(vertex.uv);
+    let t = vertex.uv.x + vertex.uv.y;
 
-    let a = vec4f(0.3, 0.5, 0.7, 1.0);
-    let b = vec4f(0.12, 0.24, 0.1, 0.0);
-    let c = vec4f(0.12, 0.24, 0.1, 0.0);
-    let d = vec4f(0.4, 0.9, 0.85, 0.0);
+    // http://iquilezles.org/articles/palettes
+    // Copyright © 2015 Inigo Quilez
+    let col = pal( t, vec3(0.5,0.5,0.5),vec3(0.5,0.5,0.5),vec3(1.0,1.0,1.0),vec3(0.0,0.33,0.67) );
 
-    return vec4f(a + b * cos(c * t));
+    return vec4f(col*col, 1.0);
 }

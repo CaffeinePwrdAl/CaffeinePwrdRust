@@ -8,9 +8,11 @@ use std::f32::consts;
 use wgpu::{util::DeviceExt};
 
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event::StartCause;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{PhysicalKey, KeyCode};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is - raw buffer type punning?
@@ -22,14 +24,14 @@ use bytemuck::{Pod, Zeroable}; // AW: Not really sure what this is - raw buffer 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
-    _pos: [f32; 4],
-    _uv: [f32; 2],
+    pos: [f32; 4],
+    uv: [f32; 2],
 }
 
 fn vertex(pos: glam::Vec4, uv: glam::Vec2) -> Vertex {
     Vertex {
-        _pos: pos.to_array(),
-        _uv: uv.to_array(),
+        pos: pos.to_array(),
+        uv: uv.to_array(),
     }
 }
 
@@ -37,8 +39,11 @@ fn vertex(pos: glam::Vec4, uv: glam::Vec2) -> Vertex {
 // Transforms - structure encapsulating the matrices we pass to the shader for transforming
 // and projecting the geometry
 //
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct Transforms {
-    mvp: glam::Mat4,
+    view_projection: glam::Mat4,
+    model: glam::Mat4,
 }
 
 impl Transforms {
@@ -46,13 +51,14 @@ impl Transforms {
         let aspect_ratio = 1.0;
         let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 10.0);
         let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(1.5f32, -5.0, 3.0),
+            glam::Vec3::new(1.5f32, 0.0, 3.0),
             glam::Vec3::ZERO,
-            glam::Vec3::Z,
+            glam::Vec3::Y,
         );
 
         Transforms {
-            mvp: proj * view
+            view_projection: (proj * view),
+            model: glam::Mat4::IDENTITY,
         }
     }
 }
@@ -68,6 +74,7 @@ struct AppData {
     index_buf: wgpu::Buffer,
     index_count: usize,
 
+    xforms_data: Transforms,
     xforms_ubo: wgpu::Buffer,
 
     bind_group_layout: wgpu::BindGroupLayout,
@@ -75,6 +82,8 @@ struct AppData {
 
     render_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    
+    t: f32,
 }
 
 impl AppData {
@@ -92,7 +101,7 @@ impl AppData {
         (vertex_data.to_vec(), index_data.to_vec())
     }
 
-    fn create_vertex_buffers(app: &AppState) -> (wgpu::Buffer, wgpu::Buffer, usize) {
+    fn create_vertex_buffers(app: &AppContext) -> (wgpu::Buffer, wgpu::Buffer, usize) {
         // Create the vertex and index buffers
         let (vertex_data, index_data) = Self::create_vertices();
 
@@ -111,17 +120,18 @@ impl AppData {
         (vertex_buf, index_buf, index_data.len())
     }
 
-    fn create_uniform_buffers(app: &AppState, xforms_data: &Transforms) -> wgpu::Buffer {
+    fn create_uniform_buffers(app: &AppContext, xforms_data: &[Transforms]) -> wgpu::Buffer {
+
         let uniform_buf = app.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(xforms_data.mvp.as_ref()),
+            contents: bytemuck::cast_slice(xforms_data),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         uniform_buf
     }
 
-    fn create_layouts(app: &AppState) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    fn create_layouts(app: &AppContext) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
         let bind_group_layout = app.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -132,7 +142,7 @@ impl AppData {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         // This is the size of a single element in the buffer.
-                        min_binding_size: wgpu::BufferSize::new(64), // AW: Is there a sizeof in Rust?
+                        min_binding_size: wgpu::BufferSize::new(2 * 16 * 4), // AW: Is there a sizeof in Rust?
                         has_dynamic_offset: false,
                     },
                     count: None,
@@ -150,7 +160,7 @@ impl AppData {
         (bind_group_layout, pipeline_layout)
     }
 
-    fn create_render_pipeline(app: &AppState, pipeline_layout: &wgpu::PipelineLayout ) -> wgpu::RenderPipeline {
+    fn create_render_pipeline(app: &AppContext, pipeline_layout: &wgpu::PipelineLayout ) -> wgpu::RenderPipeline {
         let module = app.device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         let vertex_size = size_of::<Vertex>();
@@ -209,7 +219,7 @@ impl AppData {
 
     }
 
-    fn create_xforms_bind_group(app: &AppState, bind_group_layout: &wgpu::BindGroupLayout, xforms_ubo: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn create_xforms_bind_group(app: &AppContext, bind_group_layout: &wgpu::BindGroupLayout, xforms_ubo: &wgpu::Buffer) -> wgpu::BindGroup {
         // The bind group contains the actual resources to bind to the pipeline.
         //
         // Even when the buffers are individually dropped, wgpu will keep the bind group and buffers
@@ -228,11 +238,108 @@ impl AppData {
         bind_group
     }
 
-    fn init(app: &AppState, xforms_data: &Transforms) -> Self {
+    fn create_render_target_view(&self, app: &AppContext, surface_texture: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Swapchain Texture View"),
+            format: Some(app.config.view_format),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+        });
+
+        view
+    }
+
+    fn record_command_buffer(&self, app: &AppContext, rtv: &wgpu::TextureView) -> wgpu::CommandBuffer {
+
+        // The command encoder allows us to record commands that we will later submit to the GPU.
+        let mut encoder =
+            app.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        let rpd = wgpu::RenderPassDescriptor {
+            label: Some("Triangle Render"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: rtv,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.03,
+                            g: 0.01,
+                            b: 0.1,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        };
+
+        // Scope the render pass - the encoder is borrowed while the render pass is
+        // open. When render_pass goes out of scope encoder is returned.
+        //
+        // Alternative is to render_pass.forget_lifetime()
+        {
+            let mut render_pass = encoder.begin_render_pass(&rpd);
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+
+            // Take full slice of vertex buffer
+            render_pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+
+            // Bind Index buffer
+            render_pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+
+            // Pass ranges for index count (encapsulates base_index and index_count)
+            // and instance_count (base_instance, instance_count)
+            render_pass.draw_indexed(0..self.index_count as u32, 0, 0..1);
+        }
+
+        // We finish the encoder, giving us a fully recorded command buffer.
+        let command_buffer = encoder.finish();
+
+        command_buffer
+    }
+
+    fn render_frame(&mut self, app: &AppContext, delta_t: f32) {
+
+        self.t = (self.t + delta_t) % (2.0 * consts::PI);
+
+        //println!("render_frame {0}", self.t);
+
+        self.xforms_data.model = glam::Mat4::from_axis_angle(glam::Vec3::Y, self.t);
+
+        app.queue.write_buffer(&self.xforms_ubo, 16 * 4, bytemuck::cast_slice(&[self.xforms_data.model]));
+        
+        let surface_texture = app.surface.get_current_texture()
+            .expect("Failed to acquire next swap chain texture");
+
+        let render_view = self.create_render_target_view(app, &surface_texture);
+
+        let command_buffer = self.record_command_buffer(app, &render_view);
+
+        app.queue.submit([command_buffer]);
+
+        surface_texture.present();
+    }
+
+    fn init(app: &AppContext) -> Self {
 
         let (vb, ib, index_count) = Self::create_vertex_buffers(app);
 
-        let xforms_ubo = Self::create_uniform_buffers(app, &xforms_data);
+        let xforms_data = Transforms::create_mvp_matrix();
+
+        let xforms_ubo = Self::create_uniform_buffers(app, &[xforms_data]);
 
         let (bind_group_layout, pipeline_layout) = Self::create_layouts(app);
     
@@ -240,17 +347,20 @@ impl AppData {
 
         let bind_group = Self::create_xforms_bind_group(app, &bind_group_layout, &xforms_ubo);
 
-        // AW: This probably isn't very rust-like?!
-        AppData {
+        let appdata = AppData {
             vertex_buf: vb,
             index_buf: ib,
             index_count: index_count,
+            xforms_data: xforms_data,
             xforms_ubo: xforms_ubo,
             bind_group_layout: bind_group_layout,
             pipeline_layout: pipeline_layout,
             render_pipeline: render_pipeline,
             bind_group: bind_group,
-        }
+            t: 0.0,
+        };
+
+        appdata
     }
 
 }
@@ -271,11 +381,7 @@ struct SurfaceConfig {
     view_format: wgpu::TextureFormat,
 }
 
-struct AppState {
-    // Window is an Option as we can't create windows until we're running the event handler
-    window: Arc<Window>,
-
-    // Wgpu top level objects
+struct AppContext {
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -284,10 +390,39 @@ struct AppState {
     surface: wgpu::Surface<'static>, // AW: Need to read up more on lifetimes
 }
 
+struct AppState {
+    // Window is an Option as we can't create windows until we're running the event handler
+    window: Arc<Window>,
+
+    // Wgpu top level objects
+    ctx: AppContext,
+
+    appdata: Option<AppData>,
+}
+
 
 impl AppState {
 
-    fn init(window: Arc<Window>) -> Self {        
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+
+        // Update config
+        self.ctx.config.size.width = size.width.max(1).min(2048);
+        self.ctx.config.size.height = size.height.max(1).min(2048);
+
+        // Reconfigure surface
+        self.configure_surface();
+    }
+
+    fn render(&mut self) {
+
+        // as_ref() -> don't want a copy or to own, just borrow a reference
+        // Unwrap - this will be valid at this point - might make appdata non-Optional.
+        let appdata = self.appdata.as_mut().unwrap();
+
+        appdata.render_frame(&self.ctx, 16.0 / 1000.0);
+    }
+
+    fn init(window: Arc<Window>) -> AppState {        
         // Create Instance
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
@@ -324,7 +459,7 @@ impl AppState {
         //
         // Preferentially choose a surface format
         //
-       let (surface_format, view_format) = Self::choose_surface_and_view_format(cap.formats);
+        let (surface_format, view_format) = Self::choose_surface_and_view_format(cap.formats);
 
         println!("Chosen surface format: {surface_format:?}");
         println!("Chosen view format:    {view_format:?}");
@@ -336,20 +471,22 @@ impl AppState {
             surface_format: surface_format,
         };
 
-        let state = AppState {
+        let mut state = AppState {
             window,
-            instance,
-            device,
-            queue,
-            config,
-            surface,
+            ctx: AppContext {
+                instance,
+                device,
+                queue,
+                config,
+                surface,
+            },
+            appdata: None,
         };
 
         // Further setup
         state.configure_surface();
 
-        //let xforms_data = Transforms::create_mvp_matrix();
-        //let appdata = AppData::init(&app.state, &xforms_data);
+        state.appdata = Some(AppData::init(&state.ctx));
 
         state
     }
@@ -387,15 +524,15 @@ impl AppState {
     fn configure_surface(&self) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: self.config.surface_format,
-            width: self.config.size.width,
-            height: self.config.size.height,
+            format: self.ctx.config.surface_format,
+            width: self.ctx.config.size.width,
+            height: self.ctx.config.size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![self.config.view_format],
+            view_formats: vec![self.ctx.config.view_format],
         };
-        self.surface.configure(&self.device, &surface_config);
+        self.ctx.surface.configure(&self.ctx.device, &surface_config);
     }
 }
 
@@ -485,15 +622,26 @@ impl ApplicationHandler for App {
         // };
 
         match event {
+            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Space) => {
+                        state.window.request_redraw();        
+                    },
+                    PhysicalKey::Code(KeyCode::Escape) => {
+                        event_loop.exit();        
+                    },
+                    _ => {},
+                }
+            },
             WindowEvent::CloseRequested => {
                 println!("{event:?}");
                 event_loop.exit();
             },
             WindowEvent::RedrawRequested => {
-                //println!("{event:?}");
+                //println!("Redraw");
                 
                 // Render Frame
-                //state.render()
+                state.render();
 
                 // Temporary rate limit
                 sleep(Duration::from_millis(16));
@@ -503,7 +651,7 @@ impl ApplicationHandler for App {
             },
             WindowEvent::Resized(size) => {
                 println!("Resize -> {0} x {1}", size.width, size.height);
-                //state.resize()
+                state.resize(size);
             }
             _ => (),
         }
